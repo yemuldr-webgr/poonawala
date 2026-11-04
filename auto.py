@@ -4,7 +4,11 @@
 P-Fincorp Telegram Bot — Firebase Scanner + Manual OTP Mode
 Railway-ready (long polling, no webhook, no proxy).
 
-Token is hardcoded below. ALLOWED_USERS optional env var.
+Crash-hardened:
+  • close_loop=False on run_polling (fixes "Event loop is closed")
+  • explicit network timeouts
+  • global error handler (one bad update ≠ dead bot)
+  • top-level try/except for real crash logs
 """
 
 import os
@@ -12,6 +16,7 @@ import re
 import time
 import asyncio
 import logging
+import traceback
 from collections import Counter
 from datetime import datetime
 
@@ -31,11 +36,11 @@ from telegram.ext import (
 # ─────────────────────────────────────────────────────────────────
 # CONFIG — EDIT THESE
 # ─────────────────────────────────────────────────────────────────
-BOT_TOKEN = "8878529173:AAGEudmva_H54NuTEfmdCdq4AKibM1M4rgM"          # <-- hardcoded
+BOT_TOKEN = "8878529173:AAGEudmva_H54NuTEfmdCdq4AKibM1M4rgM"   # <-- hardcoded token from @BotFather
 
 # Optional: restrict to specific Telegram user IDs.
 # Empty set = allow everyone.
-ALLOWED_USERS = set()                             # e.g. {123456789, 987654321}
+ALLOWED_USERS = set()   # e.g. {123456789, 987654321}
 
 API_ENDPOINT = "https://festive-offers.poonawallafincorp.com/api"
 REQUEST_TIMEOUT = 25
@@ -67,6 +72,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram.ext.Application").setLevel(logging.INFO)
 log = logging.getLogger("p-fincorp-bot")
 
 USER_STATE: dict[int, dict] = {}
@@ -286,7 +292,7 @@ def execute_game_play(auth_token, game_category="SHUFFLE"):
 
 
 # ─────────────────────────────────────────────────────────────────
-# FILE PERSISTENCE (Railway: attach a volume at /app/data if needed)
+# FILE PERSISTENCE
 # ─────────────────────────────────────────────────────────────────
 def append_to_file(filepath, text_line):
     try:
@@ -347,10 +353,28 @@ def fmt_reward(reward: dict, mobile: str) -> str:
 async def progress_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str):
     try:
         await ctx.bot.send_message(chat_id=update.effective_chat.id, text=text, parse_mode=ParseMode.MARKDOWN)
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning(f"progress_cb failed: {e}")
 
 
+# ─────────────────────────────────────────────────────────────────
+# GLOBAL ERROR HANDLER  (keeps the bot alive on any exception)
+# ─────────────────────────────────────────────────────────────────
+async def global_error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    log.error("Unhandled exception in update handler", exc_info=ctx.error)
+    if isinstance(update, Update) and update.effective_chat:
+        try:
+            await ctx.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="⚠️ Something went wrong. Please try again or /start.",
+            )
+        except Exception:
+            pass
+
+
+# ─────────────────────────────────────────────────────────────────
+# /start + MENU
+# ─────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         await update.message.reply_text("🚫 Not authorized.")
@@ -635,13 +659,35 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────────────────────────────
+# LIFECYCLE HOOKS
+# ─────────────────────────────────────────────────────────────────
+async def on_startup(app: Application) -> None:
+    me = await app.bot.get_me()
+    log.info(f"✅ Bot online as @{me.username} (id={me.id})")
+
+
+async def on_shutdown(app: Application) -> None:
+    log.info("🔻 Bot shutting down cleanly.")
+
+
+# ─────────────────────────────────────────────────────────────────
 # BOOT
 # ─────────────────────────────────────────────────────────────────
 def main():
     if not BOT_TOKEN or BOT_TOKEN == "PASTE_YOUR_BOT_TOKEN_HERE":
-        raise SystemExit("Set BOT_TOKEN at the top of bot.py before running.")
+        raise SystemExit("❌ Set BOT_TOKEN at the top of bot.py before running.")
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .connect_timeout(30.0)
+        .read_timeout(30.0)
+        .write_timeout(30.0)
+        .pool_timeout(30.0)
+        .post_init(on_startup)
+        .post_shutdown(on_shutdown)
+        .build()
+    )
 
     conv = ConversationHandler(
         entry_points=[
@@ -662,10 +708,25 @@ def main():
 
     app.add_handler(conv)
     app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_error_handler(global_error_handler)
 
     log.info("Bot starting (long polling, no proxy)…")
-    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+    app.run_polling(
+        close_loop=False,              # ← KEY FIX: prevents "Event loop is closed"
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES,
+        poll_interval=1.0,
+        timeout=30,
+    )
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        log.info("Interrupted by user.")
+    except SystemExit:
+        raise
+    except Exception:
+        log.error("FATAL crash during startup:\n" + traceback.format_exc())
+        raise
