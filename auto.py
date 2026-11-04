@@ -2,18 +2,14 @@
 # -*- coding: utf-8 -*-
 """
 P-Fincorp Telegram Bot — Firebase Scanner + Manual OTP Mode
-Railway-ready (long polling, no webhook).
+Railway-ready (long polling, no webhook, no proxy).
 
-ENV VARS:
-  BOT_TOKEN        (required)  Telegram bot token from @BotFather
-  ALLOWED_USERS    (optional)  Comma-separated Telegram user IDs. Empty = allow all
-  PROXY_URL        (optional)  e.g. http://user:pass@gw.proxyrise.com:443
+Token is hardcoded below. ALLOWED_USERS optional env var.
 """
 
 import os
 import re
 import time
-import json
 import asyncio
 import logging
 from collections import Counter
@@ -33,17 +29,16 @@ from telegram.ext import (
 )
 
 # ─────────────────────────────────────────────────────────────────
-# CONFIG
+# CONFIG — EDIT THESE
 # ─────────────────────────────────────────────────────────────────
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-PROXY_URL = os.environ.get("PROXY_URL", "").strip() or None
-ALLOWED_USERS = {
-    int(x) for x in os.environ.get("ALLOWED_USERS", "").replace(" ", "").split(",") if x
-}
+BOT_TOKEN = "8878529173:AAGEudmva_H54NuTEfmdCdq4AKibM1M4rgM"          # <-- hardcoded
+
+# Optional: restrict to specific Telegram user IDs.
+# Empty set = allow everyone.
+ALLOWED_USERS = set()                             # e.g. {123456789, 987654321}
 
 API_ENDPOINT = "https://festive-offers.poonawallafincorp.com/api"
 REQUEST_TIMEOUT = 25
-PROXY_DICT = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
 
 REQ_HEADERS = {
     "accept": "*/*",
@@ -65,7 +60,6 @@ REQ_HEADERS = {
     "origin": "https://festive-offers.poonawallafincorp.com",
 }
 
-# Conversation states
 WAITING_NUMBER, WAITING_OTP, WAITING_URLS = range(3)
 
 logging.basicConfig(
@@ -75,12 +69,11 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("p-fincorp-bot")
 
-# In-memory per-user state
 USER_STATE: dict[int, dict] = {}
 
 
 # ─────────────────────────────────────────────────────────────────
-# HELPERS (kept from original, unchanged logic)
+# HELPERS
 # ─────────────────────────────────────────────────────────────────
 def strip_tags(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text or "").strip()
@@ -110,7 +103,7 @@ def extract_phone_digits(raw_input):
 
 def safe_fetch_json(url_path, timeout_sec=8):
     try:
-        r = requests.get(url_path, timeout=timeout_sec, proxies=PROXY_DICT)
+        r = requests.get(url_path, timeout=timeout_sec)
         if r.status_code == 200:
             content = r.json()
             if content and content != "null":
@@ -229,7 +222,7 @@ def poll_for_target_otp(base_url, device_id, baseline_msg_ids, request_timestamp
 
 
 # ─────────────────────────────────────────────────────────────────
-# API OPERATIONS
+# API OPERATIONS (no proxy)
 # ─────────────────────────────────────────────────────────────────
 def trigger_otp_request(mobile_number):
     try:
@@ -238,7 +231,6 @@ def trigger_otp_request(mobile_number):
             headers={**REQ_HEADERS, "content-type": "application/json"},
             json={"mobile": mobile_number, "consentTerms": True, "consentCommunication": True},
             timeout=REQUEST_TIMEOUT,
-            proxies=PROXY_DICT,
         )
     except requests.RequestException as e:
         return False, f"network_error:{type(e).__name__}", 30
@@ -262,7 +254,6 @@ def confirm_otp_token(mobile_number, otp_code):
             headers={**REQ_HEADERS, "content-type": "application/json"},
             json={"mobile": mobile_number, "otp": otp_code, "referrer": "/play-and-win"},
             timeout=REQUEST_TIMEOUT,
-            proxies=PROXY_DICT,
         )
     except requests.RequestException as e:
         return None, f"network_error:{type(e).__name__}"
@@ -287,7 +278,6 @@ def execute_game_play(auth_token, game_category="SHUFFLE"):
             headers={**REQ_HEADERS, "content-type": "application/json", "authorization": f"Bearer {auth_token}"},
             json={"gameType": game_category},
             timeout=REQUEST_TIMEOUT,
-            proxies=PROXY_DICT,
         )
         j = r.json()
         return j if isinstance(j, dict) else {}
@@ -296,7 +286,7 @@ def execute_game_play(auth_token, game_category="SHUFFLE"):
 
 
 # ─────────────────────────────────────────────────────────────────
-# FILE PERSISTENCE (Railway: filesystem is ephemeral — use volumes if needed)
+# FILE PERSISTENCE (Railway: attach a volume at /app/data if needed)
 # ─────────────────────────────────────────────────────────────────
 def append_to_file(filepath, text_line):
     try:
@@ -324,7 +314,7 @@ def export_reward(mobile_num, reward_dict):
 
 
 # ─────────────────────────────────────────────────────────────────
-# TELEGRAM UI HELPERS
+# TELEGRAM UI
 # ─────────────────────────────────────────────────────────────────
 def is_allowed(user_id: int) -> bool:
     return not ALLOWED_USERS or user_id in ALLOWED_USERS
@@ -355,19 +345,14 @@ def fmt_reward(reward: dict, mobile: str) -> str:
 
 
 async def progress_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str):
-    """Stream progress into the same message (edit)."""
     try:
         await ctx.bot.send_message(chat_id=update.effective_chat.id, text=text, parse_mode=ParseMode.MARKDOWN)
     except Exception:
         pass
 
 
-# ─────────────────────────────────────────────────────────────────
-# /start + MENU
-# ─────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if not is_allowed(uid):
+    if not is_allowed(update.effective_user.id):
         await update.message.reply_text("🚫 Not authorized.")
         return ConversationHandler.END
 
@@ -559,7 +544,6 @@ async def auto_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 all_results.append("exception")
             await asyncio.sleep(2)
 
-    # Summary
     c = Counter(all_results)
     labels = {
         "won": "🎉 Rewards Claimed",
@@ -642,7 +626,7 @@ async def process_auto_target(update, ctx, mobile, firebase_url, device_id):
 
 
 # ─────────────────────────────────────────────────────────────────
-# /cancel /run
+# /cancel
 # ─────────────────────────────────────────────────────────────────
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     USER_STATE.pop(update.effective_user.id, None)
@@ -654,8 +638,8 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # BOOT
 # ─────────────────────────────────────────────────────────────────
 def main():
-    if not BOT_TOKEN:
-        raise SystemExit("BOT_TOKEN env var is required.")
+    if not BOT_TOKEN or BOT_TOKEN == "PASTE_YOUR_BOT_TOKEN_HERE":
+        raise SystemExit("Set BOT_TOKEN at the top of bot.py before running.")
 
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -679,7 +663,7 @@ def main():
     app.add_handler(conv)
     app.add_handler(CommandHandler("cancel", cmd_cancel))
 
-    log.info("Bot starting (long polling)…")
+    log.info("Bot starting (long polling, no proxy)…")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 
